@@ -64,42 +64,25 @@ def _consulta(titular: str, n=8) -> str:
     return " ".join(sel)
 
 
-def _resolver_url_real(url: str, timeout: int = 8) -> str:
-    """Sigue la redirección de Google News hasta la URL real del portal.
+def buscar_noticias(consulta: str) -> list:
+    """Devuelve [(titulo, url, medio)] desde el RSS de búsqueda de Bing News.
 
-    El RSS de búsqueda de Google News no entrega el enlace del artículo:
-    entrega un enlace propio (news.google.com/rss/articles/...) que
-    redirige al portal real. Si se filtra por dominio ANTES de resolver
-    esta redirección, TODO resultado queda descartado por tener dominio
-    "news.google.com" — que además está en DOMINIOS_EXCLUIDOS por buenas
-    razones (no queremos que una fuente final apunte a un link de Google
-    en vez del portal). La solución es resolver primero, filtrar después.
-    """
-    try:
-        req = urllib.request.Request(url, method='HEAD', headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.geturl()
-    except Exception:
-        pass
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.geturl()   # no hace falta leer el cuerpo, solo la URL final
-    except Exception:
-        return url  # no se pudo resolver: se conserva el link de Google como último recurso
-
-
-def buscar_google_news(consulta: str) -> list:
-    """Devuelve [(titulo, url, medio)] desde el RSS de Google News.
+    Se usa Bing en vez de Google News porque el RSS de Google no entrega el
+    enlace del artículo: entrega un enlace propio de redirección
+    (news.google.com/rss/articles/...) que solo resuelve mediante JavaScript
+    del lado del navegador — un HEAD o GET normal no lo sigue, así que
+    filtrar por dominio deja SIEMPRE ese dominio (news.google.com), que
+    además está excluido a propósito, y el resultado es que nunca se
+    aceptaba ninguna fuente. Bing entrega el link real del portal
+    directamente, sin ese problema.
 
     Registra cada fallo explícitamente: sin esto, un problema de red o un
-    bloqueo de Google devuelve una lista vacía indistinguible de una búsqueda
-    legítima sin resultados, y el enriquecimiento parece "funcionar" sin
-    encontrar nada, sin dar ninguna pista de por qué.
+    bloqueo devuelve una lista vacía indistinguible de una búsqueda legítima
+    sin resultados, sin dar ninguna pista de por qué.
     """
-    url = ("https://news.google.com/rss/search?q="
+    url = ("https://www.bing.com/news/search?q="
            + urllib.parse.quote(consulta)
-           + "&hl=es-419&gl=VE&ceid=VE:es-419")
+           + "&format=RSS&setmkt=es-419&cc=VE")
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
@@ -124,11 +107,15 @@ def buscar_google_news(consulta: str) -> list:
     for item in raiz.iter('item'):
         t = item.findtext('title') or ''
         l = item.findtext('link') or ''
-        src = item.find('source')
-        medio = (src.text if src is not None and src.text else '')
-        # Google agrega " - Medio" al final del titular; lo separamos.
-        if ' - ' in t and medio and t.endswith(' - ' + medio):
-            t = t[: -(len(medio) + 3)]
+        # Bing no siempre trae una etiqueta de fuente separada; cuando no
+        # está, se usa el dominio del enlace como nombre visible provisorio
+        # (queda prolijo igual: "elnacional.com" en vez de vacío).
+        medio = ''
+        for tag in ('source', 'Source', '{http://schemas.microsoft.com/rss/1.0}Source'):
+            el = item.find(tag)
+            if el is not None and el.text:
+                medio = el.text
+                break
         out.append((htmllib.unescape(t).strip(), l.strip(), medio.strip()))
     return out
 
@@ -190,50 +177,37 @@ def enriquecer(items: list, minimo=2, limite=None, dry=False) -> int:
         q = _consulta(titular)
         print(f"[{i}/{len(objetivo)}] {titular[:72]}")
         print(f"    q: {q}")
-        res = buscar_google_news(q)
+        res = buscar_noticias(q)
         presentes = {dominio(s['url']) for s in it.get('sources', [])}
 
-        # Paso 1: comparar TITULARES primero (barato, sin red). Solo a los
-        # candidatos que ya parecen la misma noticia se les resuelve el link
-        # real — así el costo de red queda acotado a unos pocos por noticia,
-        # no a los 30-70 resultados que puede traer una búsqueda genérica.
-        candidatos_titulo, sin_ancla, bajo_umbral = [], 0, 0
+        # Comparo TITULARES primero (barato). Bing entrega el link directo
+        # del portal, así que no hace falta resolver ninguna redirección
+        # antes de poder filtrar por dominio.
+        cand, sin_ancla, bajo_umbral, descartados_dominio = [], 0, 0, 0
         for t, u, medio in res:
             s = similar(titular, t)
             if s == 0.0:
                 sin_ancla += 1
-            elif s < config.UMBRAL_SIMILITUD:
+                continue
+            if s < config.UMBRAL_SIMILITUD:
                 bajo_umbral += 1
-            else:
-                candidatos_titulo.append((s, medio, u, t))
-        candidatos_titulo.sort(reverse=True)  # mejor puntaje primero
-
-        # Paso 2: resolver el link real y aplicar los filtros de dominio,
-        # solo para los que pasaron el filtro de título.
-        cupo = config.MAX_FUENTES - len(it.get('sources', []))
-        cand, resueltos, descartados_dominio = [], 0, 0
-        for s, medio, u_google, t in candidatos_titulo:
-            if len(cand) >= cupo:
-                break
-            u_real = _resolver_url_real(u_google)
-            resueltos += 1
-            d = dominio(u_real)
+                continue
+            d = dominio(u)
             if not d or d in presentes or any(x in d for x in config.DOMINIOS_EXCLUIDOS):
                 descartados_dominio += 1
                 continue
             presentes.add(d)
-            cand.append((peso_dominio(u_real), -s, medio or d, u_real, s, t))
+            cand.append((peso_dominio(u), -s, medio or d, u, s, t))
 
         print(f"    [DIAG] feed: {len(res)} resultados | "
               f"sin ancla compartida: {sin_ancla} | "
               f"con ancla pero bajo umbral: {bajo_umbral} | "
-              f"candidatos por título: {len(candidatos_titulo)} | "
-              f"links resueltos: {resueltos} | "
               f"descartados por dominio (ya presente/excluido): {descartados_dominio} | "
               f"aceptados: {len(cand)}")
         cand.sort()
+        cupo = config.MAX_FUENTES - len(it.get('sources', []))
         nuevas = []
-        for _, _, medio, u, s, t in cand:
+        for _, _, medio, u, s, t in cand[:cupo]:
             nuevas.append({'text': medio, 'url': u})
             print(f"    + [{s:.2f}] {medio}: {t[:60]}")
 
