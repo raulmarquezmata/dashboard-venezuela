@@ -65,20 +65,35 @@ def _consulta(titular: str, n=8) -> str:
 
 
 def buscar_google_news(consulta: str) -> list:
-    """Devuelve [(titulo, url, medio)] desde el RSS de Google News."""
+    """Devuelve [(titulo, url, medio)] desde el RSS de Google News.
+
+    Registra cada fallo explícitamente: sin esto, un problema de red o un
+    bloqueo de Google devuelve una lista vacía indistinguible de una búsqueda
+    legítima sin resultados, y el enriquecimiento parece "funcionar" sin
+    encontrar nada, sin dar ninguna pista de por qué.
+    """
     url = ("https://news.google.com/rss/search?q="
            + urllib.parse.quote(consulta)
            + "&hl=es-419&gl=VE&ceid=VE:es-419")
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            status = r.status
             xml = r.read()
     except Exception as e:
-        print(f"    [red] {type(e).__name__}: {e}")
+        print(f"    [DIAG] petición HTTP falló: {type(e).__name__}: {e}")
+        return []
+    if status != 200:
+        print(f"    [DIAG] HTTP {status} (se esperaba 200)")
+        return []
+    if not xml or len(xml) < 50:
+        print(f"    [DIAG] respuesta vacía o demasiado corta ({len(xml)} bytes)")
         return []
     try:
         raiz = ET.fromstring(xml)
-    except ET.ParseError:
+    except ET.ParseError as e:
+        print(f"    [DIAG] la respuesta no es XML válido ({e}). "
+              f"Primeros 200 bytes: {xml[:200]!r}")
         return []
     out = []
     for item in raiz.iter('item'):
@@ -124,6 +139,8 @@ def enriquecer(items: list, minimo=2, limite=None, dry=False) -> int:
             if s >= config.UMBRAL_SIMILITUD:
                 cand.append((peso_dominio(u), -s, medio or d, u, s, t))
 
+        print(f"    [DIAG] el feed trajo {len(res)} resultados; "
+              f"{len(cand)} superaron el umbral de similitud ({config.UMBRAL_SIMILITUD})")
         cand.sort()
         cupo = config.MAX_FUENTES - len(it.get('sources', []))
         nuevas = []
