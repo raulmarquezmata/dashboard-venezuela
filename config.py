@@ -131,8 +131,15 @@ COLOR_GREY = "E1E0D9"
 FUENTE = "Arial"
 
 # Umbral de similitud (0-1) para aceptar que dos titulares son la MISMA
-# noticia al buscar fuentes adicionales. Subirlo reduce falsos positivos.
-UMBRAL_SIMILITUD = 0.42
+# noticia al buscar fuentes adicionales. La métrica (ver enrich.similar) ya
+# exige compartir una cifra o un nombre propio como condición previa, así que
+# este umbral solo discrimina ENTRE candidatos que ya pasaron ese filtro —
+# por eso puede ser más bajo que un umbral de similitud "a secas". Calibrado
+# contra 5 casos reales de la misma noticia en dos medios (0.34 a 0.76) y 4
+# casos de noticias distintas (0.15 a 0.30): 0.32 separa ambos grupos con
+# margen. Subirlo reduce falsos positivos; bajarlo de más empieza a mezclar
+# los negativos calibrados.
+UMBRAL_SIMILITUD = 0.32
 
 # Máximo de fuentes por noticia (evita listas interminables). Contempla que
 # un portal puede aportar más de un artículo: la fuente principal más notas de
