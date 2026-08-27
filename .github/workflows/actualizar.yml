@@ -1,0 +1,49 @@
+name: Actualizar dashboard
+
+on: {workflow_dispatch: null, schedule: [{cron: '0 11 * * 1-5'}]}
+
+permissions:
+  contents: write
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Buscar fuentes adicionales
+        run: python enrich.py --min 3 --limite 40
+        continue-on-error: true
+
+      - name: Detectar cambios en news.json
+        id: check
+        run: |
+          if git diff --quiet -- news.json; then
+            echo "cambio=no" >> $GITHUB_OUTPUT
+            echo "news.json sin cambios."
+          else
+            echo "cambio=si" >> $GITHUB_OUTPUT
+            git diff --stat -- news.json
+          fi
+
+      - name: Regenerar HTML y Excel
+        if: steps.check.outputs.cambio == 'si'
+        run: python build.py
+
+      - name: Validar salida
+        if: steps.check.outputs.cambio == 'si'
+        run: |
+          python validar.py
+          node --check /tmp/c.js
+
+      - name: Commitear
+        if: steps.check.outputs.cambio == 'si'
+        run: |
+          git config user.name "solfin-bot"
