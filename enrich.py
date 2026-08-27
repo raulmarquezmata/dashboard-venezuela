@@ -64,6 +64,31 @@ def _consulta(titular: str, n=8) -> str:
     return " ".join(sel)
 
 
+def _resolver_url_real(url: str, timeout: int = 8) -> str:
+    """Sigue la redirección de Google News hasta la URL real del portal.
+
+    El RSS de búsqueda de Google News no entrega el enlace del artículo:
+    entrega un enlace propio (news.google.com/rss/articles/...) que
+    redirige al portal real. Si se filtra por dominio ANTES de resolver
+    esta redirección, TODO resultado queda descartado por tener dominio
+    "news.google.com" — que además está en DOMINIOS_EXCLUIDOS por buenas
+    razones (no queremos que una fuente final apunte a un link de Google
+    en vez del portal). La solución es resolver primero, filtrar después.
+    """
+    try:
+        req = urllib.request.Request(url, method='HEAD', headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.geturl()
+    except Exception:
+        pass
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.geturl()   # no hace falta leer el cuerpo, solo la URL final
+    except Exception:
+        return url  # no se pudo resolver: se conserva el link de Google como último recurso
+
+
 def buscar_google_news(consulta: str) -> list:
     """Devuelve [(titulo, url, medio)] desde el RSS de Google News.
 
@@ -168,33 +193,47 @@ def enriquecer(items: list, minimo=2, limite=None, dry=False) -> int:
         res = buscar_google_news(q)
         presentes = {dominio(s['url']) for s in it.get('sources', [])}
 
-        cand, sin_ancla, bajo_umbral = [], 0, 0
+        # Paso 1: comparar TITULARES primero (barato, sin red). Solo a los
+        # candidatos que ya parecen la misma noticia se les resuelve el link
+        # real — así el costo de red queda acotado a unos pocos por noticia,
+        # no a los 30-70 resultados que puede traer una búsqueda genérica.
+        candidatos_titulo, sin_ancla, bajo_umbral = [], 0, 0
         for t, u, medio in res:
-            d = dominio(u)
-            if not d or d in presentes:
-                continue
-            if any(x in d for x in config.DOMINIOS_EXCLUIDOS):
-                continue
             s = similar(titular, t)
             if s == 0.0:
                 sin_ancla += 1
             elif s < config.UMBRAL_SIMILITUD:
                 bajo_umbral += 1
             else:
-                cand.append((peso_dominio(u), -s, medio or d, u, s, t))
+                candidatos_titulo.append((s, medio, u, t))
+        candidatos_titulo.sort(reverse=True)  # mejor puntaje primero
+
+        # Paso 2: resolver el link real y aplicar los filtros de dominio,
+        # solo para los que pasaron el filtro de título.
+        cupo = config.MAX_FUENTES - len(it.get('sources', []))
+        cand, resueltos, descartados_dominio = [], 0, 0
+        for s, medio, u_google, t in candidatos_titulo:
+            if len(cand) >= cupo:
+                break
+            u_real = _resolver_url_real(u_google)
+            resueltos += 1
+            d = dominio(u_real)
+            if not d or d in presentes or any(x in d for x in config.DOMINIOS_EXCLUIDOS):
+                descartados_dominio += 1
+                continue
+            presentes.add(d)
+            cand.append((peso_dominio(u_real), -s, medio or d, u_real, s, t))
 
         print(f"    [DIAG] feed: {len(res)} resultados | "
               f"sin ancla compartida: {sin_ancla} | "
               f"con ancla pero bajo umbral: {bajo_umbral} | "
+              f"candidatos por título: {len(candidatos_titulo)} | "
+              f"links resueltos: {resueltos} | "
+              f"descartados por dominio (ya presente/excluido): {descartados_dominio} | "
               f"aceptados: {len(cand)}")
         cand.sort()
-        cupo = config.MAX_FUENTES - len(it.get('sources', []))
         nuevas = []
-        for _, _, medio, u, s, t in cand[:cupo]:
-            d = dominio(u)
-            if d in presentes:
-                continue
-            presentes.add(d)
+        for _, _, medio, u, s, t in cand:
             nuevas.append({'text': medio, 'url': u})
             print(f"    + [{s:.2f}] {medio}: {t[:60]}")
 
