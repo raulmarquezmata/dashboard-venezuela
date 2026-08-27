@@ -108,8 +108,48 @@ def buscar_google_news(consulta: str) -> list:
     return out
 
 
+def _anclas(t: str) -> set:
+    """Nombres propios (mayúscula fuera del inicio de frase, o siglas) y
+    cifras. Es una aproximación barata a 'entidad nombrada' sin librerías de
+    NLP: casi siempre acierta con marcas, personas, instituciones y montos,
+    e ignora adjetivos y sustantivos comunes aunque sean largos (a diferencia
+    de filtrar solo por longitud de palabra, que deja pasar falsos positivos
+    como "venezolana" o "farmacéutica").
+    """
+    out = set()
+    for m in re.finditer(r'\d[\d\.,%]*', t):
+        out.add(m.group())
+    for i, p in enumerate(t.split()):
+        limpio = re.sub(r'[^\wÁÉÍÓÚÑáéíóúñ]', '', p)
+        if not limpio:
+            continue
+        if limpio[0].isupper() and (i > 0 or limpio.isupper()):
+            out.add(normalizar(limpio))
+    return out
+
+
+def _jaccard(a: str, b: str) -> float:
+    A, B = set(normalizar(a).split()), set(normalizar(b).split())
+    return len(A & B) / len(A | B) if A and B else 0.0
+
+
 def similar(a: str, b: str) -> float:
-    return SequenceMatcher(None, normalizar(a), normalizar(b)).ratio()
+    """Similitud entre dos titulares, calibrada para el caso real: el mismo
+    hecho contado por dos medios con redacción distinta.
+
+    Combina estructura (SequenceMatcher) y contenido (solapamiento de
+    palabras), pero exige además que compartan al menos una 'ancla' —una
+    cifra o un nombre propio— porque el promedio solo puede dar falsos
+    positivos altos entre noticias de temas distintos con la misma forma de
+    frase ("La industria X venezolana reporta crecimiento de Y% en el primer
+    semestre" empata alto entre farmacéutica y automotriz sin esa exigencia).
+    Sin ancla compartida, se devuelve 0.0 sin más cálculo.
+    """
+    if not (_anclas(a) & _anclas(b)):
+        return 0.0
+    sm = SequenceMatcher(None, normalizar(a), normalizar(b)).ratio()
+    jc = _jaccard(a, b)
+    return (sm + jc) / 2
 
 
 def enriquecer(items: list, minimo=2, limite=None, dry=False) -> int:
@@ -128,7 +168,7 @@ def enriquecer(items: list, minimo=2, limite=None, dry=False) -> int:
         res = buscar_google_news(q)
         presentes = {dominio(s['url']) for s in it.get('sources', [])}
 
-        cand = []
+        cand, sin_ancla, bajo_umbral = [], 0, 0
         for t, u, medio in res:
             d = dominio(u)
             if not d or d in presentes:
@@ -136,11 +176,17 @@ def enriquecer(items: list, minimo=2, limite=None, dry=False) -> int:
             if any(x in d for x in config.DOMINIOS_EXCLUIDOS):
                 continue
             s = similar(titular, t)
-            if s >= config.UMBRAL_SIMILITUD:
+            if s == 0.0:
+                sin_ancla += 1
+            elif s < config.UMBRAL_SIMILITUD:
+                bajo_umbral += 1
+            else:
                 cand.append((peso_dominio(u), -s, medio or d, u, s, t))
 
-        print(f"    [DIAG] el feed trajo {len(res)} resultados; "
-              f"{len(cand)} superaron el umbral de similitud ({config.UMBRAL_SIMILITUD})")
+        print(f"    [DIAG] feed: {len(res)} resultados | "
+              f"sin ancla compartida: {sin_ancla} | "
+              f"con ancla pero bajo umbral: {bajo_umbral} | "
+              f"aceptados: {len(cand)}")
         cand.sort()
         cupo = config.MAX_FUENTES - len(it.get('sources', []))
         nuevas = []
